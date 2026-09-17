@@ -28,11 +28,18 @@
  * wide; a float32 accumulator loses precision the reference comparisons can see.
  */
 #include "k3.h"
+#if defined(K3_USE_METAL)
+#include "k3_metal.h"
+#endif
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
@@ -191,7 +198,23 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     for (int i = 0; i < dk; i++) {
         float *row = S + (size_t)i * dv;
         const float a = alpha[i];
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        int j = 0;
+        const float32x4_t va = vdupq_n_f32(a);
+        for (; j + 15 < dv; j += 16) {
+            float32x4_t r0 = vmulq_f32(vld1q_f32(row + j), va);
+            float32x4_t r1 = vmulq_f32(vld1q_f32(row + j + 4), va);
+            float32x4_t r2 = vmulq_f32(vld1q_f32(row + j + 8), va);
+            float32x4_t r3 = vmulq_f32(vld1q_f32(row + j + 12), va);
+            vst1q_f32(row + j, r0);
+            vst1q_f32(row + j + 4, r1);
+            vst1q_f32(row + j + 8, r2);
+            vst1q_f32(row + j + 12, r3);
+        }
+        for (; j < dv; j++) row[j] *= a;
+#else
         for (int j = 0; j < dv; j++) row[j] *= a;
+#endif
     }
 
     /* 2. read the state along k:  u = S^T k */
@@ -213,13 +236,29 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         if (!uheap) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
         u = uheap;
     } else {
-        for (int j = 0; j < dv; j++) u[j] = 0.0f;   /* calloc's zeroing, explicitly */
+        memset(u, 0, (size_t)dv * sizeof(float));
     }
     for (int i = 0; i < dk; i++) {
         const float ki = k[i];
         if (ki == 0.0f) continue;
         const float *row = S + (size_t)i * dv;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        int j = 0;
+        const float32x4_t vki = vdupq_n_f32(ki);
+        for (; j + 15 < dv; j += 16) {
+            float32x4_t u0 = vmlaq_f32(vld1q_f32(u + j), vld1q_f32(row + j), vki);
+            float32x4_t u1 = vmlaq_f32(vld1q_f32(u + j + 4), vld1q_f32(row + j + 4), vki);
+            float32x4_t u2 = vmlaq_f32(vld1q_f32(u + j + 8), vld1q_f32(row + j + 8), vki);
+            float32x4_t u3 = vmlaq_f32(vld1q_f32(u + j + 12), vld1q_f32(row + j + 12), vki);
+            vst1q_f32(u + j, u0);
+            vst1q_f32(u + j + 4, u1);
+            vst1q_f32(u + j + 8, u2);
+            vst1q_f32(u + j + 12, u3);
+        }
+        for (; j < dv; j++) u[j] += ki * row[j];
+#else
         for (int j = 0; j < dv; j++) u[j] += ki * row[j];
+#endif
     }
 
     /* 3. rank-one delta write. (v - u) is the prediction error: this is what makes
@@ -228,16 +267,53 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
         const float ki = k[i];
         if (ki == 0.0f) continue;
         float *row = S + (size_t)i * dv;
-        for (int j = 0; j < dv; j++) row[j] += ki * beta * (v[j] - u[j]);
+        const float factor = ki * beta;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        int j = 0;
+        const float32x4_t vfact = vdupq_n_f32(factor);
+        for (; j + 15 < dv; j += 16) {
+            float32x4_t diff0 = vsubq_f32(vld1q_f32(v + j), vld1q_f32(u + j));
+            float32x4_t diff1 = vsubq_f32(vld1q_f32(v + j + 4), vld1q_f32(u + j + 4));
+            float32x4_t diff2 = vsubq_f32(vld1q_f32(v + j + 8), vld1q_f32(u + j + 8));
+            float32x4_t diff3 = vsubq_f32(vld1q_f32(v + j + 12), vld1q_f32(u + j + 12));
+            float32x4_t r0 = vmlaq_f32(vld1q_f32(row + j), vfact, diff0);
+            float32x4_t r1 = vmlaq_f32(vld1q_f32(row + j + 4), vfact, diff1);
+            float32x4_t r2 = vmlaq_f32(vld1q_f32(row + j + 8), vfact, diff2);
+            float32x4_t r3 = vmlaq_f32(vld1q_f32(row + j + 12), vfact, diff3);
+            vst1q_f32(row + j, r0);
+            vst1q_f32(row + j + 4, r1);
+            vst1q_f32(row + j + 8, r2);
+            vst1q_f32(row + j + 12, r3);
+        }
+        for (; j < dv; j++) row[j] += factor * (v[j] - u[j]);
+#else
+        for (int j = 0; j < dv; j++) row[j] += factor * (v[j] - u[j]);
+#endif
     }
 
     /* 4. output from the ALREADY UPDATED state: o = S^T q */
-    for (int j = 0; j < dv; j++) o[j] = 0.0f;
+    memset(o, 0, (size_t)dv * sizeof(float));
     for (int i = 0; i < dk; i++) {
         const float qi = q[i];
         if (qi == 0.0f) continue;
         const float *row = S + (size_t)i * dv;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        int j = 0;
+        const float32x4_t vqi = vdupq_n_f32(qi);
+        for (; j + 15 < dv; j += 16) {
+            float32x4_t o0 = vmlaq_f32(vld1q_f32(o + j), vld1q_f32(row + j), vqi);
+            float32x4_t o1 = vmlaq_f32(vld1q_f32(o + j + 4), vld1q_f32(row + j + 4), vqi);
+            float32x4_t o2 = vmlaq_f32(vld1q_f32(o + j + 8), vld1q_f32(row + j + 8), vqi);
+            float32x4_t o3 = vmlaq_f32(vld1q_f32(o + j + 12), vld1q_f32(row + j + 12), vqi);
+            vst1q_f32(o + j, o0);
+            vst1q_f32(o + j + 4, o1);
+            vst1q_f32(o + j + 8, o2);
+            vst1q_f32(o + j + 12, o3);
+        }
+        for (; j < dv; j++) o[j] += qi * row[j];
+#else
         for (int j = 0; j < dv; j++) o[j] += qi * row[j];
+#endif
     }
     free(uheap);                                  /* free(NULL) is a no-op */
 }
@@ -264,6 +340,11 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
  */
 void k3_matmul(float *y, const float *x, const float *W, int in, int out)
 {
+#if defined(K3_USE_METAL)
+    if (k3_metal_is_enabled()) {
+        if (k3_metal_matmul_f32(y, x, W, in, out) == 0) return;
+    }
+#endif
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
@@ -1090,6 +1171,11 @@ static const float K3_E2M1[16] = {
  */
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
+#if defined(K3_USE_METAL)
+    if (k3_metal_is_enabled()) {
+        if (k3_metal_matmul_bf16(y, x, W, in, out) == 0) return;
+    }
+#endif
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
@@ -1386,6 +1472,12 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
     const int pcols = in / 2;                     /* two elements per byte */
     const int ngrp  = (in + group - 1) / group;
     const int gbyte = group / 2;
+
+#if defined(K3_USE_METAL)
+    if (k3_metal_is_enabled()) {
+        if (k3_metal_matmul_mxfp4(y, x, packed, scales, in, rows, group) == 0) return;
+    }
+#endif
 
 #if !defined(__AVX2__)
     if (!k3_pair_ready)  k3_pair_init();

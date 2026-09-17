@@ -63,7 +63,8 @@ ifeq ($(UNAME_S),Darwin)
   # command-line assignments override makefile assignments regardless of flavour.
   OMP_PREFIX := $(shell brew --prefix libomp 2>/dev/null || echo /opt/homebrew/opt/libomp)
   OMP_CFLAGS ?= -Xpreprocessor -fopenmp -I$(OMP_PREFIX)/include
-  OMP_LDFLAGS ?= -L$(OMP_PREFIX)/lib -lomp
+  OMP_LDFLAGS ?= -L$(OMP_PREFIX)/lib -lomp -framework Metal -framework Foundation
+  METAL_CFLAGS := -DK3_USE_METAL=1
   # Say what is wrong and how to fix it, rather than letting the compiler report a
   # missing omp.h fifty lines into the build.
   ifeq ($(wildcard $(OMP_PREFIX)/include/omp.h),)
@@ -135,7 +136,7 @@ WARN     := -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter
 # -pthread is for the trunk's asynchronous reader, which is a plain pthread rather than
 # an OpenMP construct. It composes with the platform OpenMP flags above rather than
 # replacing them: Apple Clang needs -Xpreprocessor -fopenmp AND -pthread.
-CFLAGS   ?= -O3 -std=gnu99 $(WARN) $(ARCH) $(OMP_CFLAGS) -pthread -ffp-contract=off
+CFLAGS   ?= -O3 -std=gnu99 $(WARN) $(ARCH) $(OMP_CFLAGS) $(METAL_CFLAGS) -pthread -ffp-contract=off
 LDFLAGS  ?= -lm $(OMP_LDFLAGS) -pthread
 
 # Flat include search across the module dirs: sources use "k3.h", "k3_cache.h" etc
@@ -144,18 +145,27 @@ INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
             -Isrc/core -Isrc/io -Isrc/cache -Isrc/model -Isrc/tokenizer
 
 # ----------------------------------------------------------------------------- files --
-ENGINE_SRC := src/core/k3_ops.c \
-              src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c \
-              src/cache/k3_cache.c \
-              src/model/k3_bind.c
-ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
+ifeq ($(UNAME_S),Darwin)
+  ENGINE_SRC := src/core/k3_ops.c src/core/k3_metal.m \
+                src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c \
+                src/cache/k3_cache.c \
+                src/model/k3_bind.c
+  CORE_OBJ   := $(BUILD)/src/core/k3_ops.o $(BUILD)/src/core/k3_metal.o
+  UNIT_TESTS := test_ops test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk test_metal
+else
+  ENGINE_SRC := src/core/k3_ops.c \
+                src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c \
+                src/cache/k3_cache.c \
+                src/model/k3_bind.c
+  CORE_OBJ   := $(BUILD)/src/core/k3_ops.o
+  UNIT_TESTS := test_ops test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk
+endif
+ENGINE_OBJ := $(patsubst %.m,$(BUILD)/%.o,$(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC)))
 
 CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk
-# Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
 
@@ -178,6 +188,10 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
+$(BUILD)/%.o: %.m
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+
 $(CLI_BIN): $(CLI_SRC) $(ENGINE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $(CLI_SRC) $(ENGINE_OBJ) -o $@ $(LDFLAGS)
 
@@ -185,19 +199,19 @@ $(BIN):
 	@mkdir -p $(BIN)
 
 # Each test links only what it needs, so a failure points at one subsystem.
-$(BIN)/test_ops: tests/unit/test_ops.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+$(BIN)/test_ops: tests/unit/test_ops.c $(CORE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_cache: tests/unit/test_cache.c $(BUILD)/src/cache/k3_cache.o \
                    $(BUILD)/src/io/k3_load.o $(BUILD)/src/io/k3_st.o \
-                   $(BUILD)/src/core/k3_ops.o | $(BIN)
+                   $(CORE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_st: tests/unit/test_st.c $(BUILD)/src/io/k3_st.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_model_stream: tests/unit/test_model_stream.c $(BUILD)/src/model/k3_bind.o \
-                          $(BUILD)/src/io/k3_st.o $(BUILD)/src/core/k3_ops.o | $(BIN)
+                          $(BUILD)/src/io/k3_st.o $(CORE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 # The tokenizer and config reader are portable C99 with no OpenMP and no platform calls,
@@ -210,19 +224,22 @@ $(BIN)/test_cfg: tests/unit/test_cfg.c src/core/k3_ops.c | $(BIN)
 
 # Allocates at REAL model widths (a ~1.8 GB KDA layer), so it needs the optimised build
 # rather than the portable C99 one the tokenizer and config tests use.
-$(BIN)/scale_test: tests/unit/scale_test.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+$(BIN)/scale_test: tests/unit/scale_test.c $(CORE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
-$(BIN)/k3_model: tests/unit/k3_model.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+$(BIN)/k3_model: tests/unit/k3_model.c $(CORE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_trunk: tests/unit/test_trunk.c $(BUILD)/src/io/k3_trunk.o \
                    $(BUILD)/src/io/k3_st.o \
                    $(BUILD)/src/model/k3_bind.o \
-                   $(BUILD)/src/core/k3_ops.o | $(BIN)
+                   $(CORE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
-$(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+$(BIN)/bench_kernels: benchmarks/bench_kernels.c $(CORE_OBJ) | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/test_metal: tests/unit/test_metal.c $(CORE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 ## test: everything that needs no model weights
@@ -266,6 +283,9 @@ test: $(CLI_BIN) $(TEST_BINS)
 	@echo "== real dimensions ==";   ./$(BIN)/scale_test
 	@echo "== trunk streaming ==";   ./$(BIN)/test_trunk
 	@echo "== full-model oracle =="; ./$(BIN)/k3_model $(FIXTURES)
+	@if [ -f "$(BIN)/test_metal" ]; then \
+	    ./$(BIN)/test_metal; \
+	fi
 	@echo
 	@if [ ! -f "$(TOK_FILES)/tiktoken.model" ]; then \
 	     echo "NOTE: tokenizer parity did NOT run; see above. Everything else did."; \
