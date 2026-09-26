@@ -27,8 +27,45 @@ endif()
 option(K3_NATIVE_ARCH "Optimise for the building CPU (-march/-mcpu=native)" OFF)
 option(K3_SANITIZE    "Build with ASan + UBSan"                        OFF)
 
-find_package(OpenMP)
 find_package(Threads REQUIRED)
+
+# Apple Clang ships no OpenMP runtime and does not search Homebrew's libomp by itself,
+# so find_package(OpenMP) fails on a stock macOS toolchain and the build silently
+# drops to a single-threaded engine. Mirror the Makefile: locate an installed libomp
+# explicitly and treat a miss as a warning the developer can act on, not as a reason
+# to build a different execution configuration without saying so. Everywhere else
+# find_package(OpenMP) already does the right thing and is left alone.
+if(APPLE)
+  set(K3_OMP_PREFIX "" CACHE PATH "Prefix containing libomp include/ and lib/")
+  if(NOT K3_OMP_PREFIX)
+    execute_process(COMMAND brew --prefix libomp
+                    OUTPUT_VARIABLE K3_OMP_PREFIX
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+  endif()
+  if(K3_OMP_PREFIX)
+    find_path(K3_OMP_INCLUDE_DIR NAMES omp.h HINTS ${K3_OMP_PREFIX}/include)
+    find_library(K3_OMP_LIBRARY NAMES omp HINTS ${K3_OMP_PREFIX}/lib)
+  endif()
+  if(K3_OMP_INCLUDE_DIR AND K3_OMP_LIBRARY)
+    # Same flags the Makefile passes: -Xpreprocessor -fopenmp for Apple Clang, the
+    # header dir, and the library itself. Exposed through one imported target so the
+    # link line below is identical on every platform.
+    add_library(k3_openmp INTERFACE IMPORTED)
+    set_target_properties(k3_openmp PROPERTIES
+      INTERFACE_COMPILE_OPTIONS "-Xpreprocessor;-fopenmp"
+      INTERFACE_INCLUDE_DIRECTORIES "${K3_OMP_INCLUDE_DIR}"
+      INTERFACE_LINK_LIBRARIES "${K3_OMP_LIBRARY}")
+    set(K3_OPENMP_TARGET k3_openmp)
+  else()
+    message(WARNING "Homebrew libomp was not found; install it with `brew install libomp` or configure -DK3_OMP_PREFIX=/path/to/libomp. Building without OpenMP.")
+  endif()
+else()
+  find_package(OpenMP)
+  if(OpenMP_C_FOUND)
+    set(K3_OPENMP_TARGET OpenMP::OpenMP_C)
+  endif()
+endif()
 
 add_library(k3_flags INTERFACE)
 target_compile_options(k3_flags INTERFACE
@@ -74,14 +111,27 @@ target_include_directories(k3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer)
 
 target_link_libraries(k3 PUBLIC k3_flags m Threads::Threads)
-if(OpenMP_C_FOUND)
-  target_link_libraries(k3 PUBLIC OpenMP::OpenMP_C)
+if(K3_OPENMP_TARGET)
+  target_link_libraries(k3 PUBLIC ${K3_OPENMP_TARGET})
 endif()
 
 # ------------------------------------------------------------------------------ cli --
 add_executable(k3_cli src/cli/k3_run.c)
 set_target_properties(k3_cli PROPERTIES OUTPUT_NAME k3)
-target_link_libraries(k3_cli PRIVATE k3)
+
+# Chat is deliberately separate from the inference library: it is CLI policy and
+# transcript handling, not a new framework or a second execution backend.
+add_library(k3_chat STATIC src/chat/k3_chat.c src/chat/k3_sampler.c)
+target_include_directories(k3_chat PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/chat
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+# k3_chat.c includes k3_portable_io.h for the fsync/rename shims its history writer
+# uses on Windows. The Makefile passes -Isrc/io to everything; here only this target
+# needs it, and privately, so the chat library's public surface stays src/chat.
+target_include_directories(k3_chat PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/io)
+target_link_libraries(k3_chat PUBLIC k3_flags m)
+target_link_libraries(k3_cli PRIVATE k3 k3_chat)
 
 # ---------------------------------------------------------------------------- tests --
 # Every test below runs WITHOUT model weights. The checkpoint is 1.56 TB; if correctness
@@ -99,6 +149,9 @@ k3_add_test(test_st     tests/unit/test_st.c)
 k3_add_test(test_model_stream tests/unit/test_model_stream.c)
 k3_add_test(test_cfg    tests/unit/test_cfg.c)
 k3_add_test(test_tok    tests/unit/test_tok.c)
+k3_add_test(test_chat   tests/unit/test_chat.c)
+k3_add_test(test_st_faults tests/unit/test_st_faults.c)
+target_link_libraries(test_chat PRIVATE k3_chat)
 k3_add_test(scale_test  tests/unit/scale_test.c)
 k3_add_test(test_trunk  tests/unit/test_trunk.c)
 k3_add_test(k3_model    tests/unit/k3_model.c)
@@ -114,6 +167,13 @@ add_test(NAME config     COMMAND test_cfg   fixture ${FIX}/ref_k3.json)
 add_test(NAME scale      COMMAND scale_test)
 add_test(NAME trunk      COMMAND test_trunk)
 add_test(NAME oracle     COMMAND k3_model   ${FIX})
+add_test(NAME chat_template
+         COMMAND ${CMAKE_COMMAND}
+                 -DTEST_CHAT=$<TARGET_FILE:test_chat>
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run_chat_test.cmake)
+# Same contract as the tokenizer entry below: without this property a "SKIPPED:" run is
+# recorded as a pass, and a gate that cannot fail is worse than one that is absent.
+set_tests_properties(chat_template PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
 
 # The negative half of the config contract. Each fixture is the working flat config with
 # exactly one field mutated, so a rejection can only come from that field. Without these
@@ -127,6 +187,7 @@ add_test(NAME config_reject_bad_topk
          COMMAND test_cfg reject ${FIX}/cfg/bad_topk.json)
 add_test(NAME safetensors COMMAND test_st   ${FIX}/st ${CMAKE_CURRENT_BINARY_DIR}/idx.json
          plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32)
+add_test(NAME shard_faults COMMAND test_st_faults ${FIX}/st ${CMAKE_CURRENT_BINARY_DIR}/stfault)
 add_test(NAME model_stream COMMAND test_model_stream ${FIX}/st)
 add_test(NAME ultra_cli_contract
          COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:k3_cli>

@@ -44,6 +44,7 @@
 #define K3_TOK_H
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "json.h"
@@ -78,13 +79,17 @@ static inline int k3_b64(const char *in, int n, unsigned char *out)
         for (int i = 0; i < 64; i++) t[(unsigned char)A[i]] = (signed char)i;
         init = 1;
     }
-    int o = 0, acc = 0, bits = 0;
+    int o = 0, bits = 0;
+    uint32_t acc = 0;
     for (int i = 0; i < n; i++) {
         unsigned char c = (unsigned char)in[i];
         if (c == '=') break;
         signed char v = t[c];
         if (v < 0) return -1;
-        acc = (acc << 6) | v;
+        /* Keeping the low bits in an unsigned accumulator is intentional: groups are
+         * decoded continuously and only the pending low `bits` are observed. Signed
+         * overflow here was undefined behaviour on long tokenizer lines. */
+        acc = (acc << 6) | (uint32_t)v;
         bits += 6;
         if (bits >= 8) { bits -= 8; out[o++] = (unsigned char)((acc >> bits) & 0xFF); }
     }
@@ -190,6 +195,13 @@ static inline void k3_tok_load(Tok *T, const char *files_dir)
     jval *adt  = json_get(root, "added_tokens_decoder");
     if (!adt) {
         fprintf(stderr, "k3_tok: tokenizer_config.json has no added_tokens_decoder\n");
+        exit(1);
+    }
+    /* json_get only guarantees non-NULL, not the type. An array here leaves
+     * adt->keys NULL (arrays never set keys) and atoi(NULL) crashes two
+     * lines below; a scalar silently yields zero specials. */
+    if (adt->t != J_OBJ) {
+        fprintf(stderr, "k3_tok: added_tokens_decoder is not an object\n");
         exit(1);
     }
 

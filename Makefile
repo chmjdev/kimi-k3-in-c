@@ -115,6 +115,7 @@ else
   endif
   OMP_CFLAGS ?= -fopenmp
   OMP_LDFLAGS ?= -fopenmp
+  ASAN_RUN_OPTIONS ?= detect_leaks=1:halt_on_error=1
 endif
 
 # Linux and macOS: the platform's own CC already has a working sanitizer runtime, so
@@ -141,7 +142,7 @@ LDFLAGS  ?= -lm $(OMP_LDFLAGS) -pthread
 # Flat include search across the module dirs: sources use "k3.h", "k3_cache.h" etc
 # rather than path-qualified includes, which keeps them relocatable.
 INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
-            -Isrc/core -Isrc/io -Isrc/cache -Isrc/model -Isrc/tokenizer
+            -Isrc/core -Isrc/io -Isrc/cache -Isrc/model -Isrc/tokenizer -Isrc/chat
 
 # ----------------------------------------------------------------------------- files --
 ENGINE_SRC := src/core/k3_ops.c \
@@ -151,10 +152,11 @@ ENGINE_SRC := src/core/k3_ops.c \
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
 
 CLI_SRC    := src/cli/k3_run.c
+CHAT_SRC   := src/chat/k3_chat.c src/chat/k3_sampler.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk
+UNIT_TESTS := test_ops test_cache test_st test_model_stream test_cfg test_tok test_chat scale_test k3_model test_trunk test_st_faults
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -178,8 +180,8 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(CLI_BIN): $(CLI_SRC) $(ENGINE_OBJ) | $(BIN)
-	$(CC) $(CFLAGS) $(INCLUDES) $(CLI_SRC) $(ENGINE_OBJ) -o $@ $(LDFLAGS)
+$(CLI_BIN): $(CLI_SRC) $(CHAT_SRC) $(ENGINE_OBJ) | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $(CLI_SRC) $(CHAT_SRC) $(ENGINE_OBJ) -o $@ $(LDFLAGS)
 
 $(BIN):
 	@mkdir -p $(BIN)
@@ -200,10 +202,16 @@ $(BIN)/test_model_stream: tests/unit/test_model_stream.c $(BUILD)/src/model/k3_b
                           $(BUILD)/src/io/k3_st.o $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+$(BIN)/test_st_faults: tests/unit/test_st_faults.c $(BUILD)/src/io/k3_st.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 # The tokenizer and config reader are portable C99 with no OpenMP and no platform calls,
 # so they build and are verifiable on any machine, including one with no checkpoint.
 $(BIN)/test_tok: tests/unit/test_tok.c | $(BIN)
 	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $< -o $@
+
+$(BIN)/test_chat: tests/unit/test_chat.c src/chat/k3_chat.c src/chat/k3_sampler.c | $(BIN)
+	$(CC) $(CFLAGS) -Wno-unused-function $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_cfg: tests/unit/test_cfg.c src/core/k3_ops.c | $(BIN)
 	$(CC) -O2 -std=c99 $(WARN) -Wno-unused-function $(INCLUDES) $^ -o $@ -lm
@@ -250,6 +258,7 @@ test: $(CLI_BIN) $(TEST_BINS)
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
 	@echo "== model streaming ==";   ./$(BIN)/test_model_stream $(FIXTURES)/st
+	@echo "== shard faults ==";     ./$(BIN)/test_st_faults $(FIXTURES)/st $(BUILD)/stfault
 	@echo "== config reader ==";     ./$(BIN)/test_cfg fixture $(FIXTURES)/ref_k3.json
 	@echo "== config refusals =="; \
 	  for f in no_layermap bad_layer_index bad_topk; do \
@@ -260,8 +269,26 @@ test: $(CLI_BIN) $(TEST_BINS)
 	      ./$(BIN)/test_tok "$(TOK_FILES)" roundtrip src/core/k3_ops.c; \
 	  else \
 	      echo "  NOT RUN: no tiktoken.model at $(TOK_FILES)"; \
-	      echo "           the vocabulary ships with the checkpoint, not with this"; \
-	      echo "           repository. Run: make tok TOK_FILES=/path/to/k3model"; \
+	          echo "           the vocabulary ships with the checkpoint, not with this"; \
+	          echo "           repository. Run: make tok TOK_FILES=/path/to/k3model"; \
+	 fi
+	@echo "== chat option contract =="; \
+	  for args in "--no-think" "--thinking-effort low" "--chat --thinking-effort medium" "--chat --no-think --thinking-effort low"; do \
+	      out=$$(./$(CLI_BIN) fake $$args 2>&1); rc=$$?; \
+	      test $$rc -eq 2 || { echo "  k3 fake $$args returned $$rc, expected 2"; exit 1; }; \
+	      case "$$out" in *--no-think*|*--thinking-effort*) ;; \
+	          *) echo "  '$$args' was refused, but not because of the thinking flags:"; \
+	             echo "      $$out"; \
+	             echo "  the model dir is 'fake', so the exit code alone would pass on the loader's error"; exit 1;; \
+	      esac; \
+	  done; echo "  4 misuses of --no-think/--thinking-effort refused, each for the right reason"
+	@echo "== chat template =="; \
+	  if [ -f "$(TOK_FILES)/tiktoken.model" ]; then \
+	      ./$(BIN)/test_chat "$(TOK_FILES)"; \
+	  else \
+	      echo "  NOT RUN: no tiktoken.model at $(TOK_FILES)"; \
+	      echo "           the XTML template is checked against the released tokenizer,"; \
+	      echo "           which ships with the checkpoint. Run: make test TOK_FILES=/path/to/k3model"; \
 	  fi
 	@echo "== real dimensions ==";   ./$(BIN)/scale_test
 	@echo "== trunk streaming ==";   ./$(BIN)/test_trunk

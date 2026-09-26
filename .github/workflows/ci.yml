@@ -121,11 +121,18 @@ jobs:
       # posix_memalign and getrusage become on this platform, and why -static and
       # -lpsapi (which the Makefile's Windows branch adds automatically) are
       # load-bearing rather than stylistic here.
+      #
+      # mingw-w64-x86_64-libgomp is explicit rather than left to the gcc package to
+      # pull in: MSYS2 lists it as an OPTIONAL dependency of
+      # mingw-w64-x86_64-gcc, not a required one, so a plain install of gcc leaves it
+      # absent. -static needs the static archive specifically, and the link then fails
+      # with "cannot find -lgomp" on a toolchain that otherwise looks complete,
+      # confirmed directly rather than assumed.
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
           update: true
-          install: mingw-w64-x86_64-gcc make
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp make
 
       - name: Build (default flags, platform detection)
         run: make
@@ -168,7 +175,7 @@ jobs:
         run: |
           make CC=clang CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" \
                LDFLAGS="-lm -fsanitize=address,undefined -lpsapi -lwinpthread" ARCH= \
-               bin/test_ops bin/test_cfg bin/test_cache bin/test_st bin/k3_model
+               bin/test_ops bin/test_cfg bin/test_cache bin/test_st bin/test_st_faults bin/k3_model
           cp /clang64/bin/libclang_rt.asan_dynamic-x86_64.dll /clang64/bin/libwinpthread-1.dll /clang64/bin/libc++.dll bin/
       - name: Run under sanitizers
         env:
@@ -183,6 +190,7 @@ jobs:
           ./bin/test_cache.exe tests/fixtures/cache
           ./bin/test_st.exe tests/fixtures/st /tmp/idx.json \
             plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
+          ./bin/test_st_faults.exe tests/fixtures/st /tmp/stfault
           ./bin/k3_model.exe tests/fixtures
 
   # CMakeLists.txt documents itself as staying interchangeable with the Make build, but
@@ -238,7 +246,7 @@ jobs:
         run: |
           make CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer" \
                LDFLAGS="-lm -fsanitize=address,undefined" ARCH= \
-               bin/test_ops bin/test_cfg bin/test_cache bin/test_st \
+               bin/test_ops bin/test_cfg bin/test_cache bin/test_st bin/test_st_faults \
                bin/test_model_stream bin/k3_model \
                bin/bench_kernels \
                -j"$(nproc)"
@@ -255,6 +263,7 @@ jobs:
           ./bin/test_cache tests/fixtures/cache
           ./bin/test_st tests/fixtures/st "$RUNNER_TEMP/idx.json" \
             plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
+          ./bin/test_st_faults tests/fixtures/st "$RUNNER_TEMP/stfault"
           ./bin/test_model_stream tests/fixtures/st
           ./bin/k3_model tests/fixtures
           # The ms and GFLOP/s it prints are meaningless under -O1 with ASan interceptors
