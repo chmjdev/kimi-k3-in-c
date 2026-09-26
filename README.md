@@ -3431,3 +3431,7 @@ for reference and remains the property of its authors.
 <br>
 <sub>Built for the proposition that a trillion-parameter model should not require a trillion-dollar rack.</sub>
 </div>
+
+## Lab01 deployment experiment
+
+See [Lab01 measured CPU tuning and storage gate](docs/LAB01.md) before downloading weights onto the shared lab host.

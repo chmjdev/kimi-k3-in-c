@@ -1,0 +1,117 @@
+[
+  {
+    "threads": 4,
+    "samples_ms": [
+      [
+        7.83,
+        1.33
+      ],
+      [
+        8.75,
+        1.45
+      ],
+      [
+        7.76,
+        1.45
+      ]
+    ],
+    "median_bf16_ms": 7.83,
+    "median_mxfp4_ms": 1.45,
+    "output_hashes": [
+      "83c8504a4cb3fac6",
+      "a231061237b5579d"
+    ]
+  },
+  {
+    "threads": 12,
+    "samples_ms": [
+      [
+        4.03,
+        0.99
+      ],
+      [
+        3.96,
+        0.83
+      ],
+      [
+        4.0,
+        0.86
+      ]
+    ],
+    "median_bf16_ms": 4.0,
+    "median_mxfp4_ms": 0.86,
+    "output_hashes": [
+      "83c8504a4cb3fac6",
+      "a231061237b5579d"
+    ]
+  },
+  {
+    "threads": 16,
+    "samples_ms": [
+      [
+        4.16,
+        0.71
+      ],
+      [
+        3.91,
+        0.92
+      ],
+      [
+        3.88,
+        0.75
+      ]
+    ],
+    "median_bf16_ms": 3.91,
+    "median_mxfp4_ms": 0.75,
+    "output_hashes": [
+      "83c8504a4cb3fac6",
+      "a231061237b5579d"
+    ]
+  },
+  {
+    "threads": 24,
+    "samples_ms": [
+      [
+        3.63,
+        0.4
+      ],
+      [
+        3.63,
+        0.37
+      ],
+      [
+        3.62,
+        0.41
+      ]
+    ],
+    "median_bf16_ms": 3.63,
+    "median_mxfp4_ms": 0.4,
+    "output_hashes": [
+      "83c8504a4cb3fac6",
+      "a231061237b5579d"
+    ]
+  },
+  {
+    "threads": 48,
+    "samples_ms": [
+      [
+        3.62,
+        0.35
+      ],
+      [
+        3.62,
+        0.38
+      ],
+      [
+        3.64,
+        0.34
+      ]
+    ],
+    "median_bf16_ms": 3.62,
+    "median_mxfp4_ms": 0.35,
+    "output_hashes": [
+      "83c8504a4cb3fac6",
+      "a231061237b5579d"
+    ]
+  }
+]
