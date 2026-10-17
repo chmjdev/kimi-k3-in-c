@@ -7,6 +7,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Apple Silicon preparation script and Mac setup guide, with observed M5 Pro
+  build, synthetic oracle and Metal parity results. Full checkpoint storage and
+  tokenizer validation remain pending.
+
 - **`--stop-id N`** (repeatable, up to 8): generation halts as soon as the model emits
   a listed token id. Off by default, so `--gen N` still means exactly N tokens for
   every benchmark and oracle gate. The stop id stays in the sequence, so `--save-state`

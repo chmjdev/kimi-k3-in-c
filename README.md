@@ -1,3 +1,5 @@
+[Apple Silicon preparation and validation](docs/MACOS.md): run `./scripts/prepare-mac.sh` from this checkout.
+
 <div align="center">
 
 <h1>kimi-k3-in-c</h1>
