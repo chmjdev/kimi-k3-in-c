@@ -23,6 +23,9 @@
 #include <time.h>
 
 #include "k3.h"
+#if defined(K3_USE_METAL)
+#include "k3_metal.h"
+#endif
 
 static double now_s(void)
 {
@@ -99,6 +102,10 @@ int main(void)
     printf("built WITHOUT AVX2 or NEON (scalar)\n\n");
 #endif
 
+#if defined(K3_USE_METAL)
+    k3_metal_set_enabled(0);
+#endif
+
     /* ---------- bf16 trunk matmul: KDA q_proj, 7168 -> 12288 ---------- */
     {
         const int in = 7168, out = 12288;
@@ -155,6 +162,67 @@ int main(void)
         printf("             16 experts x 3 mats x 92 layers -> %.2f s/token\n", per_tok);
         free(pk); free(sc); free(x); free(y);
     }
+
+#if defined(K3_USE_METAL)
+    if (k3_metal_is_available()) {
+        printf("\n=======================================================\n");
+        printf("Apple Silicon Metal GPU Benchmark (%s)\n", k3_metal_device_name());
+        printf("=======================================================\n\n");
+        k3_metal_set_enabled(1);
+
+        /* ---------- Metal BF16 trunk matmul ---------- */
+        {
+            const int in = 7168, out = 12288;
+            uint16_t *W = (uint16_t *)malloc((size_t)in * out * sizeof(uint16_t));
+            float *x = (float *)malloc((size_t)in * sizeof(float));
+            float *y = (float *)malloc((size_t)out * sizeof(float));
+            if (!W || !x || !y) { printf("alloc failed\n"); return 1; }
+            fillbf16(W, (size_t)in * out, 12345u);
+            fillf(x, in, 999u);
+
+            k3_metal_matmul_bf16(y, x, W, in, out); /* warm */
+            const int reps = 15;
+            const double t0 = now_s();
+            for (int r = 0; r < reps; r++) k3_metal_matmul_bf16(y, x, W, in, out);
+            const double dt = (now_s() - t0) / reps;
+            const double gflop = 2.0 * in * out / 1e9;
+            printf("Metal BF16   %5d x %-5d  %7.2f ms  %8.1f GFLOP/s\n",
+                   out, in, dt * 1e3, gflop / dt);
+            fnv("bf16 ", y, out);
+            printf("             trunk is 56.74 G params/token -> %.2f s/token on GPU\n",
+                   2.0 * 56.74e9 / 1e9 / (gflop / dt));
+            free(W); free(x); free(y);
+        }
+
+        /* ---------- Metal MXFP4 expert matmul ---------- */
+        {
+            const int in = 3584, rows = 3072, group = K3_MXFP4_GROUP;
+            const int pcols = in / 2, ngrp = in / group;
+            unsigned char *pk = (unsigned char *)malloc((size_t)rows * pcols);
+            unsigned char *sc = (unsigned char *)malloc((size_t)rows * ngrp);
+            float *x = (float *)malloc((size_t)in * sizeof(float));
+            float *y = (float *)malloc((size_t)rows * sizeof(float));
+            if (!pk || !sc || !x || !y) { printf("alloc failed\n"); return 1; }
+            fillb(pk, (size_t)rows * pcols, 777u);
+            memset(sc, 127, (size_t)rows * ngrp);
+            fillf(x, in, 4242u);
+
+            k3_metal_matmul_mxfp4(y, x, pk, sc, in, rows, group); /* warm */
+            const int reps = 15;
+            const double t0 = now_s();
+            for (int r = 0; r < reps; r++) k3_metal_matmul_mxfp4(y, x, pk, sc, in, rows, group);
+            const double dt = (now_s() - t0) / reps;
+            const double gflop = 2.0 * in * rows / 1e9;
+            printf("\nMetal MXFP4  %5d x %-5d  %7.2f ms  %8.1f GFLOP/s\n",
+                   rows, in, dt * 1e3, gflop / dt);
+            fnv("mxfp4", y, rows);
+            const double per_tok = dt * 3.0 * 16 * 92;
+            printf("             16 experts x 3 mats x 92 layers -> %.2f s/token on GPU\n", per_tok);
+            free(pk); free(sc); free(x); free(y);
+        }
+        k3_metal_shutdown();
+    }
+#endif
 
     printf("\nmeasured compute budget at the floor is about 10 s/token; whichever line\n"
            "above dominates it is the one worth vectorising.\n");

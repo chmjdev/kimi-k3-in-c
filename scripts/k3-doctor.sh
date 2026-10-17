@@ -15,10 +15,10 @@
 
 set -u
 
-case "$(uname -s)" in
-    Linux) ;;
-    *)  echo "k3-doctor: this script and the streaming engine are Linux-only."
-        echo "  (/proc/meminfo, O_DIRECT, GNU stat/df). Detected: $(uname -s)"
+OS="$(uname -s)"
+case "$OS" in
+    Linux|Darwin) ;;
+    *)  echo "k3-doctor: unsupported OS: $OS"
         exit 1 ;;
 esac
 
@@ -54,43 +54,67 @@ fi
 hdr "cpu"
 NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 ok "cores: $NCPU"
-if grep -qm1 avx2 /proc/cpuinfo 2>/dev/null; then
-    ok "AVX2: present"
+if [ "$OS" = "Darwin" ]; then
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "arm64" ]; then
+        CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "Apple Silicon")
+        ok "Apple Silicon: $CHIP (NEON SIMD)"
+        if command -v system_profiler >/dev/null 2>&1; then
+            GPU_NAME=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{print $2; exit}')
+            [ -n "$GPU_NAME" ] && ok "Metal GPU: $GPU_NAME (accelerated)" || ok "Metal GPU: present"
+        fi
+    else
+        ok "Intel Mac (x86_64)"
+    fi
 else
-    warn "AVX2 not detected, the engine will run but the expert matmuls lose their fast path"
+    if grep -qm1 avx2 /proc/cpuinfo 2>/dev/null; then
+        ok "AVX2: present"
+    else
+        warn "AVX2 not detected, the engine will run but the expert matmuls lose their fast path"
+    fi
+    grep -qm1 avx512f /proc/cpuinfo 2>/dev/null && ok "AVX-512: present" \
+        || printf '  %sinfo  AVX-512 absent (not required)%s\n' "$DIM" "$RST"
 fi
-grep -qm1 avx512f /proc/cpuinfo 2>/dev/null && ok "AVX-512: present" \
-    || printf '  %sinfo  AVX-512 absent (not required)%s\n' "$DIM" "$RST"
 
 # --------------------------------------------------------------------- memory --
 hdr "memory"
-MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
-MEM_GB=$(( MEM_KB / 1024 / 1024 ))
-AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
-AVAIL_GB=$(( AVAIL_KB / 1024 / 1024 ))
+if [ "$OS" = "Darwin" ]; then
+    MEM_BYTES=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+    MEM_GB=$(( MEM_BYTES / 1024 / 1024 / 1024 ))
+    PAGE_SIZE=$(vm_stat 2>/dev/null | awk '/page size of/{print $8}' || echo 16384)
+    FREE_PAGES=$(vm_stat 2>/dev/null | awk '/Pages free/{gsub("\\.",""); print $3}' || echo 0)
+    INACTIVE_PAGES=$(vm_stat 2>/dev/null | awk '/Pages inactive/{gsub("\\.",""); print $3}' || echo 0)
+    SPEC_PAGES=$(vm_stat 2>/dev/null | awk '/Pages speculative/{gsub("\\.",""); print $3}' || echo 0)
+    AVAIL_BYTES=$(( (FREE_PAGES + INACTIVE_PAGES + SPEC_PAGES) * PAGE_SIZE ))
+    AVAIL_GB=$(( AVAIL_BYTES / 1024 / 1024 / 1024 ))
+else
+    MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    MEM_GB=$(( MEM_KB / 1024 / 1024 ))
+    AVAIL_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    AVAIL_GB=$(( AVAIL_KB / 1024 / 1024 ))
+fi
 ok "total: ${MEM_GB} GB, available: ${AVAIL_GB} GB"
 
-# Boundaries follow the measured memory ladder (docs/PERFORMANCE.md). Expectations are v1.0.0
-# anchors from docs/data/speed-2026-08.md on the reference box (124 cores, fast NVMe): treat
-# them as order-of-magnitude, not a promise. Streaming presets (laptop/desktop/workstation)
-# scale with your disk; the trunk becomes resident above ~128 GB, where decode is compute-bound
-# and scales with core count instead.
-if   [ "$AVAIL_GB" -ge 192 ]; then PRESET=server;      EXPECT="~6 s/token"
-elif [ "$AVAIL_GB" -ge  96 ]; then PRESET=workstation; EXPECT="~6-20 s/token"
-elif [ "$AVAIL_GB" -ge  32 ]; then PRESET=desktop;     EXPECT="~24 s/token"
-elif [ "$AVAIL_GB" -ge  10 ]; then PRESET=laptop;      EXPECT="~27 s/token"
-else PRESET=""; fi
+# Boundaries follow the measured memory ladder (docs/PERFORMANCE.md).
+if [ "$OS" = "Darwin" ]; then
+    if   [ "$MEM_GB" -ge 128 ]; then PRESET=mac-128gb; EXPECT="~5-8 s/token (full trunk pinned)"
+    elif [ "$MEM_GB" -ge  64 ]; then PRESET=mac-64gb;  EXPECT="~10-18 s/token"
+    elif [ "$MEM_GB" -ge  36 ]; then PRESET=mac-36gb;  EXPECT="~18-25 s/token"
+    elif [ "$MEM_GB" -ge  16 ]; then PRESET=mac-16gb;  EXPECT="~25-30 s/token"
+    elif [ "$MEM_GB" -ge   8 ]; then PRESET=mac-air;   EXPECT="~30-40 s/token"
+    else PRESET=""; fi
+else
+    if   [ "$AVAIL_GB" -ge 192 ]; then PRESET=server;      EXPECT="~6 s/token"
+    elif [ "$AVAIL_GB" -ge  96 ]; then PRESET=workstation; EXPECT="~6-20 s/token"
+    elif [ "$AVAIL_GB" -ge  32 ]; then PRESET=desktop;     EXPECT="~24 s/token"
+    elif [ "$AVAIL_GB" -ge  10 ]; then PRESET=laptop;      EXPECT="~27 s/token"
+    else PRESET=""; fi
+fi
 
 if [ -n "$PRESET" ]; then
     ok "recommended preset: --preset $PRESET   (expect $EXPECT)"
 else
-    # A warning, not a failure. This threshold is about RUNNING the checkpoint; it says
-    # nothing about building the engine or running the test suite, both of which need no
-    # weights and pass comfortably here. `make test`'s own ceiling is the ~1.7 GB single
-    # allocation in tests/unit/scale_test.c. Failing the whole check on this number told
-    # people their machine was broken when the only thing they could not do was the one
-    # thing that needs 1.56 TB of disk they also did not have.
-    warn "under 10 GB available, below the floor for running the checkpoint (~8.2 GB peak RSS)"
+    warn "under 8 GB total memory, below the floor for running the checkpoint (~8.2 GB peak RSS)"
     printf '  %s      the build and "make test" need no weights and work fine here%s\n' \
         "$DIM" "$RST"
 fi
@@ -99,24 +123,41 @@ fi
 hdr "storage"
 TARGET="${MODEL_DIR:-$PWD}"
 if [ -d "$TARGET" ]; then
-    AVAIL_DISK=$(df -BG "$TARGET" 2>/dev/null | awk 'NR==2{gsub("G","",$4); print $4}')
+    if [ "$OS" = "Darwin" ]; then
+        AVAIL_DISK=$(df -g "$TARGET" 2>/dev/null | awk 'NR==2{print $4}')
+    else
+        AVAIL_DISK=$(df -BG "$TARGET" 2>/dev/null | awk 'NR==2{gsub("G","",$4); print $4}')
+    fi
     ok "free space at $TARGET: ${AVAIL_DISK:-?} GB"
     # 1.56 TB checkpoint + ~109 GB packed trunk.
     if [ -n "${AVAIL_DISK:-}" ] && [ "$AVAIL_DISK" -lt 1700 ]; then
         warn "the full checkpoint needs ~1.56 TB plus ~109 GB for the packed trunk"
     fi
 
-    printf '  %smeasuring sequential read (2 GB, this takes a moment)…%s\n' "$DIM" "$RST"
+    printf '  %smeasuring sequential read (1 GB, this takes a moment)…%s\n' "$DIM" "$RST"
     TMPF="$TARGET/.k3_doctor_probe"
-    if dd if=/dev/zero of="$TMPF" bs=1M count=2048 conv=fsync 2>/dev/null; then
-        sync
-        RATE=$(dd if="$TMPF" of=/dev/null bs=4M 2>&1 | awk '/copied/{print $(NF-1)" "$NF}')
-        rm -f "$TMPF"
-        ok "sequential read: ${RATE:-unknown}"
-        printf '  %sthe engine streams ~135 GB per token; storage is usually the ceiling%s\n' "$DIM" "$RST"
+    if [ "$OS" = "Darwin" ]; then
+        if dd if=/dev/zero of="$TMPF" bs=1m count=1024 2>/dev/null; then
+            sync
+            RATE=$(dd if="$TMPF" of=/dev/null bs=4m 2>&1 | awk '/bytes/{print $(NF-1)" "$NF}' || true)
+            rm -f "$TMPF"
+            ok "sequential read: ${RATE:-unknown}"
+            printf '  %sthe engine streams ~135 GB per token; storage is usually the ceiling%s\n' "$DIM" "$RST"
+        else
+            warn "could not write a probe file to $TARGET"
+            rm -f "$TMPF" 2>/dev/null
+        fi
     else
-        warn "could not write a probe file to $TARGET"
-        rm -f "$TMPF" 2>/dev/null
+        if dd if=/dev/zero of="$TMPF" bs=1M count=2048 conv=fsync 2>/dev/null; then
+            sync
+            RATE=$(dd if="$TMPF" of=/dev/null bs=4M 2>&1 | awk '/copied/{print $(NF-1)" "$NF}')
+            rm -f "$TMPF"
+            ok "sequential read: ${RATE:-unknown}"
+            printf '  %sthe engine streams ~135 GB per token; storage is usually the ceiling%s\n' "$DIM" "$RST"
+        else
+            warn "could not write a probe file to $TARGET"
+            rm -f "$TMPF" 2>/dev/null
+        fi
     fi
 else
     warn "no model directory given; pass one as the first argument to check its storage"

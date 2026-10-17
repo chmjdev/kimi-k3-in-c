@@ -68,6 +68,13 @@
 #include "k3_chat.h"
 #include "k3_sampler.h"
 #include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#if defined(K3_USE_METAL)
+#include "k3_metal.h"
+#endif
+#endif
 
 static double now_s(void)
 {
@@ -352,7 +359,8 @@ static void usage(FILE *f)
 "  --ids 1,2,3           raw token ids; the reproducible channel used by the tests\n"
 "\n"
 "memory:\n"
-"  --preset NAME         auto | ultra | laptop | desktop | workstation | server | max\n"
+"  --preset NAME         auto | ultra | laptop | desktop | workstation | server | max |\n"
+"                        mac-air | mac-16gb | mac-36gb | mac-64gb | mac-128gb\n"
 "                        auto sizes both budgets from this machine's free RAM,\n"
 "                        trunk-first; also spelled --trunk-gb auto\n"
 "  --list-presets        show each preset's split and expected speed\n"
@@ -406,6 +414,10 @@ static void usage(FILE *f)
 "  --no-think            answer in the response channel directly: no think channel and\n"
 "                        no thinking-effort message (the encoder's thinking=False)\n"
 "  --thinking-effort E   low, high or max (default max, as the checkpoint's tokenizer sets)\n"
+"hardware acceleration:\n"
+"  --gpu MODE            auto | metal | off (default auto on macOS)\n"
+"  --metal               enable Apple Silicon Metal GPU acceleration\n"
+"  --no-gpu              disable GPU acceleration; use CPU only\n"
 "\n"
 "diagnostics:\n"
 "  --config PATH         model config; defaults to <model_dir>/config.json\n"
@@ -457,6 +469,16 @@ static const K3Preset K3_PRESETS[] = {
       "~128 GB peak RSS; 90 of 93 trunk layers pinned. Fastest." },
     { "max",        110.0,109.0, 0,
       "~224 GB peak RSS; trunk pinned and a large expert cache." },
+    { "mac-air",     2.5,   0.5, 0,
+      "~8 GB Mac: minimal unified memory footprint." },
+    { "mac-16gb",    8.0,   2.0, 0,
+      "~16 GB Mac: balanced trunk and expert cache." },
+    { "mac-36gb",   20.0,   6.0, 0,
+      "~36 GB Mac Pro: large trunk pin for smooth interactive inference." },
+    { "mac-64gb",   45.0,   8.0, 0,
+      "~64 GB Mac Studio/Pro: deep trunk caching across unified RAM." },
+    { "mac-128gb", 110.0,   8.0, 0,
+      "~128 GB Mac Studio/Pro: trunk fully pinned into unified memory." },
 };
 enum { K3_NPRESET = (int)(sizeof K3_PRESETS / sizeof K3_PRESETS[0]) };
 
@@ -519,6 +541,24 @@ static double mem_available_bytes(void)
     ms.dwLength = sizeof ms;
     if (!GlobalMemoryStatusEx(&ms)) return 0.0;
     return (double)ms.ullAvailPhys;
+#elif defined(__APPLE__)
+    vm_size_t page_size = 0;
+    mach_port_t mach_port = mach_host_self();
+    vm_statistics64_data_t vm_stat;
+    mach_msg_type_number_t count = sizeof(vm_stat) / sizeof(natural_t);
+    if (host_page_size(mach_port, &page_size) == KERN_SUCCESS &&
+        host_statistics64(mach_port, HOST_VM_INFO64, (host_info64_t)&vm_stat, &count) == KERN_SUCCESS) {
+        int64_t avail_bytes = ((int64_t)vm_stat.free_count +
+                               (int64_t)vm_stat.inactive_count +
+                               (int64_t)vm_stat.speculative_count) * (int64_t)page_size;
+        return (double)avail_bytes;
+    }
+    int64_t memsize = 0;
+    size_t len = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0) {
+        return (double)memsize * 0.5;
+    }
+    return 0.0;
 #else
     FILE *f = fopen("/proc/meminfo", "r");
     if (!f) return 0.0;
@@ -913,6 +953,7 @@ int main(int argc, char **argv)
     int temperature_set = 0, top_p_set = 0, seed_set = 0, out_set = 0;
     double temperature = 1.0, top_p = 0.95;
     uint64_t seed = 0;
+    int gpu_mode = 2;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
@@ -920,6 +961,15 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) { gen = atoi(argv[++i]); gen_set = 1; }
+        else if (!strcmp(argv[i], "--gpu") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "off") || !strcmp(m, "none") || !strcmp(m, "cpu")) gpu_mode = 0;
+            else if (!strcmp(m, "metal") || !strcmp(m, "on")) gpu_mode = 1;
+            else if (!strcmp(m, "auto")) gpu_mode = 2;
+            else { fprintf(stderr, "unknown --gpu mode '%s' (use auto, metal, or off)\n", m); return 2; }
+        }
+        else if (!strcmp(argv[i], "--metal")) gpu_mode = 1;
+        else if (!strcmp(argv[i], "--no-gpu")) gpu_mode = 0;
         else if (!strcmp(argv[i], "--stop-id") && i + 1 < argc) {
             if (n_stop >= (int)(sizeof stop_id / sizeof stop_id[0])) {
                 fprintf(stderr, "--stop-id given more than %d times\n",
@@ -1099,7 +1149,7 @@ int main(int argc, char **argv)
     if (budget_auto) {
         const double avail = mem_available_bytes();
         if (avail <= 0.0) {
-            fprintf(stderr, "--preset auto needs /proc/meminfo; pass explicit "
+            fprintf(stderr, "--preset auto could not determine available memory; pass explicit "
                             "--trunk-gb/--cache-gb on this platform\n");
             return 2;
         }
@@ -1376,6 +1426,26 @@ int main(int argc, char **argv)
     if (preset_name)
         printf("  preset   : %s (trunk %.2f GB / expert cache %.2f GB)\n",
                preset_name, trunk_gb, cache_gb);
+
+#if defined(K3_USE_METAL)
+    if (gpu_mode == 1 || gpu_mode == 2) {
+        if (k3_metal_init()) {
+            k3_metal_set_enabled(1);
+            printf("  compute  : Apple Silicon GPU (%s) via Metal\n", k3_metal_device_name());
+        } else if (gpu_mode == 1) {
+            fprintf(stderr, "k3: Metal GPU requested but Metal initialization failed\n");
+            return 2;
+        } else {
+            k3_metal_set_enabled(0);
+            printf("  compute  : CPU (NEON / OpenMP)\n");
+        }
+    } else {
+        k3_metal_set_enabled(0);
+        printf("  compute  : CPU (NEON / OpenMP)\n");
+    }
+#else
+    printf("  compute  : CPU\n");
+#endif
     printf("\n");
 
     K3St st;
@@ -2095,6 +2165,10 @@ int main(int argc, char **argv)
     k3_bind_model_free(&w.mb);
     k3_st_close(&st);
     free(h); free(br); free(ks); free(sc); free(lg); free(generated_text);
+
+#if defined(K3_USE_METAL)
+    k3_metal_shutdown();
+#endif
 
     /* A dropped expert means some token was computed with part of its routed sum
      * missing. The run still produced token ids and they still look plausible, which is
