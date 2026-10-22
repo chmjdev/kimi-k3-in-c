@@ -97,16 +97,26 @@ mkdir -p "$DEST"
 # Free-space preflight. Without this the transfer runs until the filesystem fills, which
 # takes the machine's logging and package manager with it, and the byte-total check below
 # then reports a mismatch -- a true statement that misdiagnoses the actual failure.
-AVAIL=$(df -P -k "$DEST" | awk 'NR==2 {print $4 * 1024}')
-if [ "$AVAIL" -lt "$EXPECT_BYTES" ]; then
-    printf 'FAIL: %s has %s bytes free, the checkpoint needs %s.\n' \
-        "$DEST" "$AVAIL" "$EXPECT_BYTES" >&2
-    printf '      Short by %s bytes (%.2f TB). Point <dest_dir> at a larger filesystem.\n' \
-        "$((EXPECT_BYTES - AVAIL))" \
-        "$(awk -v d="$((EXPECT_BYTES - AVAIL))" 'BEGIN{print d/1e12}')" >&2
-    printf '      Packing the trunk afterwards needs a further ~109 GB.\n' >&2
-    exit 1
-fi
+# Budget for the subsequent packed trunk and preserve operational headroom.
+# Set K3_TRUNK_BYTES=0 only when packing onto a different, separately sized volume.
+TRUNK_BYTES="${K3_TRUNK_BYTES:-109000000000}"
+RESERVE_BYTES="${K3_RESERVE_BYTES:-50000000000}"
+for value in "$TRUNK_BYTES" "$RESERVE_BYTES"; do
+    case "$value" in
+        ''|*[!0-9]*) echo "storage budgets must be non-negative integer bytes" >&2; exit 2 ;;
+    esac
+done
+# Python integers avoid shell overflow and awk scientific notation on TB-sized disks.
+python3 - "$DEST" "$EXPECT_BYTES" "$TRUNK_BYTES" "$RESERVE_BYTES" <<'PYSPACE'
+import shutil, sys
+path, checkpoint, trunk, reserve = sys.argv[1:]
+required = int(checkpoint) + int(trunk) + int(reserve)
+free = shutil.disk_usage(path).free
+if free < required:
+    print(f"FAIL: {path} has {free} bytes free; checkpoint + trunk + reserve need {required}.", file=sys.stderr)
+    print(f"Short by {required - free} bytes. Use a larger local volume.", file=sys.stderr)
+    sys.exit(1)
+PYSPACE
 
 echo "downloading $REPO@$REVISION -> $DEST"
 echo "  1.56 TB across $EXPECT_SHARDS shards; expect ~30 min at 1 GB/s"
